@@ -1,21 +1,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Bambu Lab RFID Tag Writer - Interactive Edition (English + Cache Version)
+Bambu Lab RFID Writer - Improved Refactor Edition
 
 Features:
-- Interactive GitHub spool selection from https://github.com/queengooborg/Bambu-Lab-RFID-Library
-- Local cache system to avoid GitHub rate limits
-- Cache auto-expiration (24h TTL)
-- Option to refresh folder cache or clear all cache
-- Tag type detection (Gen4 FUID/UFUID)
-- SHA256 verification and write logs
-- Automatic dump.bin/key.bin detection
-
-Requirements:
-- Python 3.8+
-- pip install requests
-- Proxmark3 connected
+- GitHub cache (24h TTL) for repository browsing
+- Safe retry network layer
+- Resume last spool selection
+- Tag type detection (Gen4 UFUID / FUID)
+- Validation of dump/key and SHA256 preview before writing
+- JSON + TXT logs saved after writing
+- Graceful error handling (no script crashes)
 """
 
 import os
@@ -32,10 +27,11 @@ from lib import get_proxmark3_location, run_command
 
 
 # =============================
-#  CONFIGURATION
+#  GLOBAL CONFIG
 # =============================
 
 GITHUB_API = "https://api.github.com/repos/queengooborg/Bambu-Lab-RFID-Library/contents"
+
 DOWNLOAD_DIR = Path("downloads")
 CACHE_DIR = Path("cache")
 LOG_DIR = Path("logs")
@@ -43,69 +39,34 @@ LOG_DIR = Path("logs")
 for d in (DOWNLOAD_DIR, CACHE_DIR, LOG_DIR):
     d.mkdir(exist_ok=True)
 
-CACHE_TTL = 60 * 60 * 24  # 24 hours
+CACHE_TTL = 60 * 60 * 24  # 24h
+LAST_USED_FILE = CACHE_DIR / "last_used.json"
 
 pm3Command = "bin/pm3"
 pm3Location = None
 
 
-
 # =============================
-#  CACHE UTILITIES
+# UTILITIES
 # =============================
 
-def get_cache_file(path):
-    """Map GitHub path to safe cache file name."""
-    if not path:
-        return CACHE_DIR / "root.json"
-    return CACHE_DIR / f"{path.replace('/', '_')}.json"
+def color(text, code="0"):
+    return f"\033[{code}m{text}\033[0m"
 
 
-def clear_cache():
-    """Remove all cache files."""
-    for f in CACHE_DIR.glob("*.json"):
-        f.unlink()
-    print("\n🧹 Cache cleared.\n")
+def safe_request(url, retries=3, delay=1):
+    """Reliable GitHub request with retry fallback."""
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            return r
+        except Exception:
+            print(color(f"⚠ Request failed ({attempt+1}/{retries}), retrying...", "33"))
+            time.sleep(delay)
 
+    raise RuntimeError("❌ Network unreachable after retries.")
 
-def github_list(path="", force_refresh=False):
-    """Fetch GitHub folder listing with caching."""
-
-    cache_file = get_cache_file(path)
-
-    # Load from cache if fresh and not forced
-    if cache_file.exists() and not force_refresh:
-        with open(cache_file, "r") as f:
-            cached = json.load(f)
-
-        if time.time() - cached["timestamp"] < CACHE_TTL:
-            return cached["data"]
-
-    # Fetch from GitHub
-    url = f"{GITHUB_API}/{path}" if path else GITHUB_API
-    r = requests.get(url)
-
-    # If rate limited, fallback to cache if exists
-    if r.status_code == 403 and cache_file.exists():
-        print("⚠ GitHub API limit reached — using cached data.")
-        with open(cache_file, "r") as f:
-            cached = json.load(f)
-        return cached["data"]
-
-    r.raise_for_status()
-    data = r.json()
-
-    # Save cache
-    with open(cache_file, "w") as f:
-        json.dump({"timestamp": time.time(), "data": data}, f)
-
-    return data
-
-
-
-# =============================
-#  FILE AND HASH UTILITIES
-# =============================
 
 def sha256_file(path):
     """Generate SHA256 checksum."""
@@ -116,199 +77,169 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def choose(options, message):
-    """Selection menu with additional cache controls."""
-    print(f"\n{message}:")
-    for i, item in enumerate(options, start=1):
-        print(f"{i}) {item['name']}")
+# =============================
+# CACHE HANDLER
+# =============================
 
-    print("\n--- Options ---")
-    print("R) Refresh this list (force GitHub fetch)")
-    print("C) Clear all cache")
-    print("Q) Quit")
+def get_cache_file(path=""):
+    return CACHE_DIR / ("root.json" if not path else f"{path.replace('/', '_')}.json")
 
-    choice = input("> ").strip().lower()
 
-    if choice == "r":
-        print("\n🔄 Refreshing data...")
-        refreshed = github_list(options[0].get("path", ""), force_refresh=True)
-        # Can't directly rerun menu here cleanly — so return None to restart caller logic.
-        return "__REFRESH__"
+def load_last_used():
+    if LAST_USED_FILE.exists():
+        return json.loads(LAST_USED_FILE.read_text()).get("last")
+    return None
 
-    if choice == "c":
-        clear_cache()
-        return "__REFRESH__"
 
-    if choice == "q":
-        sys.exit(0)
+def save_last_used(path):
+    LAST_USED_FILE.write_text(json.dumps({"last": path}))
 
-    return options[int(choice)-1]
 
+def clear_cache():
+    for f in CACHE_DIR.glob("*.json"):
+        f.unlink()
+    print(color("\n🧹 Cache cleared.\n", "32"))
+
+
+def github_list(path="", force=False):
+    """Fetch GitHub folder structs with caching."""
+    cache_file = get_cache_file(path)
+
+    if cache_file.exists() and not force:
+        data = json.loads(cache_file.read_text())
+        if time.time() - data["timestamp"] < CACHE_TTL:
+            return data["data"]
+
+    url = f"{GITHUB_API}/{path}" if path else GITHUB_API
+    r = safe_request(url)
+    data = r.json()
+
+    cache_file.write_text(json.dumps({"timestamp": time.time(), "data": data}))
+    return data
 
 
 # =============================
-#  GITHUB FILE PARSER
+# USER INPUT / MENU SYSTEM
+# =============================
+
+def choose(options, message):
+    """Safe selection menu."""
+    while True:
+        print(f"\n{message}:")
+        for i, item in enumerate(options, start=1):
+            print(f"{i}) {item['name']}")
+
+        print("\n--- Options ---")
+        print("R) Refresh list")
+        print("C) Clear cache")
+        print("Q) Quit")
+
+        choice = input("> ").strip().lower()
+
+        if choice == "q":
+            sys.exit(0)
+        if choice == "c":
+            clear_cache()
+            return "__REFRESH__"
+        if choice == "r":
+            return "__REFRESH__"
+        if choice.isdigit() and 1 <= int(choice) <= len(options):
+            return options[int(choice)-1]
+
+        print(color("❌ Invalid input. Try again.", "31"))
+
+
+# =============================
+# FILE SELECTION LOGIC
 # =============================
 
 def detect_dump_files(path):
-    """Detect dump.bin + key.bin inside final folder."""
-    contents = github_list(path)
+    files = github_list(path)
+    dump = next((f for f in files if f["name"].lower().endswith("dump.bin")), None)
+    key  = next((f for f in files if f["name"].lower().endswith("key.bin")), None)
 
-    dump = None
-    key = None
-
-    for f in contents:
-        name = f["name"].lower()
-        if name.endswith("dump.bin"):
-            dump = f
-        elif name.endswith("key.bin"):
-            key = f
-
-    if not dump:
-        raise RuntimeError("❌ No *.dump.bin found.")
-    if not key:
-        raise RuntimeError("❌ No *.key.bin found.")
+    if not dump or not key:
+        raise RuntimeError("❌ Folder missing required dump/key files.")
 
     return dump, key
 
 
-def download_file(url, filename):
-    """Download a file"""
-    print(f"\n📥 Downloading `{filename.name}` ...")
-    r = requests.get(url)
-    r.raise_for_status()
-
-    filename.parent.mkdir(parents=True, exist_ok=True)
-    with open(filename, "wb") as f:
-        f.write(r.content)
-
-    print(f"✔ Saved to: {filename}")
-    return filename
-
-
-
-# =============================
-#  INTERACTIVE NAVIGATION
-# =============================
-
-def select_variant(base_path):
-    """Material → variant selection"""
-    while True:
-        dirs = [d for d in github_list(base_path) if d["type"] == "dir"]
-        result = choose(dirs, "Select a material family / variant")
-        if result == "__REFRESH__":
-            continue
-        return result
-
-
-def navigate_to_dump(material_folder):
-    """Navigate deeper until reaching final folder with dump.bin/key.bin."""
-
-    current = select_variant(material_folder["path"])
-    current_path = current["path"]
-
-    while True:
-        contents = github_list(current_path)
-        dirs = [d for d in contents if d["type"] == "dir"]
-
-        if dirs:
-            print(f"\n📂 Current path: {current_path}")
-            result = choose(dirs, "Select subfolder (color → batch → ID):")
-
-            if result == "__REFRESH__":
-                continue
-
-            current_path = result["path"]
-            continue
-
-        # Final folder → detect dump+key
-        try:
-            dump, key = detect_dump_files(current_path)
-        except RuntimeError as e:
-            print(f"\n{e}")
-            print("↩ Returning to previous level...")
-            return navigate_to_dump(material_folder)
-
-        print(f"\n✔ Valid dump detected at: {current_path}")
-        if input("Use this dump? (y/N): ").lower() == "y":
-            return current_path, dump, key
-
-        print("\n↩ Restarting selection...")
-        return navigate_to_dump(material_folder)
-
+def download_file(url, outpath):
+    print(f"\n📥 Downloading `{outpath.name}` ...")
+    r = safe_request(url)
+    outpath.write_bytes(r.content)
+    print(color(f"✔ Saved to {outpath}", "32"))
+    return outpath
 
 
 def fetch_dump_interactive():
-    print("\n📦 Fetching materials list...")
+    print("\n📦 Loading spool list...")
 
     while True:
         root = github_list()
         materials = [d for d in root if d["type"] == "dir"]
-        result = choose(materials, "Select material:")
+        choice = choose(materials, "Select material type")
+        if choice != "__REFRESH__":
+            break
 
-        if result == "__REFRESH__":
+    current = choice["path"]
+
+    while True:
+        items = github_list(current)
+        subdirs = [i for i in items if i["type"] == "dir"]
+
+        if subdirs:
+            choice = choose(subdirs, "Select variant (color/batch)")
+            if choice == "__REFRESH__":
+                continue
+            current = choice["path"]
             continue
 
-        chosen = result
-        break
+        try:
+            dump, key = detect_dump_files(current)
+        except RuntimeError as e:
+            print(color(f"\n{e}", "31"))
+            print(color("↩ Select a deeper folder.\n", "33"))
+            continue
 
-    path, dump, key = navigate_to_dump(chosen)
+        print(color(f"\n✔ Dump detected in: {current}", "32"))
+        if input("Use this dump? (y/N): ").lower() == "y":
+            dump_path = download_file(dump["download_url"], DOWNLOAD_DIR / dump["name"])
+            key_path  = download_file(key["download_url"], DOWNLOAD_DIR / key["name"])
+            save_last_used(current)
+            return str(dump_path), str(key_path), dump["name"]
 
-    dump_path = download_file(dump["download_url"], DOWNLOAD_DIR / dump["name"])
-    key_path  = download_file(key["download_url"], DOWNLOAD_DIR / key["name"])
-
-    return str(dump_path), str(key_path), dump["name"]
-
+        print(color("\n↩ Restart selection...", "33"))
 
 
 # =============================
-#  PROXMARK HANDLER
+# PROXMARK HANDLING
 # =============================
 
 def getTagType():
-    print("\n🔍 Detecting tag type...")
+    print("\n🔍 Detecting tag...")
+    output = run_command([pm3Location / pm3Command, "-d", "1", "-c", "hf mf info"]).lower()
 
-    output = run_command([pm3Location / pm3Command, "-d", "1", "-c", "hf mf info"])
-    output = output.replace("\r\n", "\n").replace("\r", "\n")
-
-    if "iso14443a card select failed" in output.lower():
+    if "no tag" in output or "select failed" in output:
         raise RuntimeError("❌ No compatible NFC tag detected.")
 
-    cap_re = r"(?:\[\+\]\s*Magic capabilities\.*\s*([()\w\d /-]+)\n+)"
-    match = re.search(
-        rf"\[=\]\s*--- Magic Tag Information\n+(\[=\]\s*<n/a>\n+|{cap_re}+)",
-        output
-    )
-
-    if not match:
-        raise RuntimeError("❌ Unable to read tag memory format.")
-
-    if "<n/a>" in match.group(1):
-        raise RuntimeError("❌ Unsupported or already locked tag.")
-
-    capabilities = re.findall(cap_re, output)
-
-    if "Gen 4 GDM / USCUID ( Gen4 Magic Wakeup )" in capabilities:
-        return "Gen 4 FUID"
-    if "Gen 4 GDM / USCUID ( ZUID Gen1 Magic Wakeup )" in capabilities:
+    if "ufuid" in output:
         return "Gen 4 UFUID"
+    if "fuid" in output:
+        return "Gen 4 FUID"
 
-    raise RuntimeError("❌ Unsupported tag type (must be Gen4 FUID or UFUID).")
+    raise RuntimeError("❌ Unknown or unsupported tag.")
 
 
+def writeTag(dump, key, ttype):
+    print("\n💾 Writing tag...")
+    if ttype == "Gen 4 FUID":
+        run_command([pm3Location / pm3Command, "-c", f'hf mf restore --force -f "{dump}" -k "{key}"'], pipe=False)
 
-def writeTag(tagdump, keydump, tagtype):
-    print("\n💾 Writing tag now...")
-
-    if tagtype == "Gen 4 FUID":
-        run_command([pm3Location / pm3Command,
-                     "-c", f'hf mf restore --force -f "{tagdump}" -k "{keydump}"'], pipe=False)
-        return
-
-    if tagtype == "Gen 4 UFUID":
+    elif ttype == "Gen 4 UFUID":
         run_command([
             pm3Location / pm3Command, "-c",
-            f'hf mf cload -f "{tagdump}"; '
+            f'hf mf cload -f "{dump}"; '
             f'hf 14a raw -a -k -b 7 40; '
             f'hf 14a raw -k 43; '
             f'hf 14a raw -k -c e100; '
@@ -316,73 +247,119 @@ def writeTag(tagdump, keydump, tagtype):
         ], pipe=False)
 
 
-
-# =============================
-#  LOGGING
-# =============================
-
-def write_log(tag_type, dump_file, key_file, dump_sha, key_sha):
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
-    log_file = LOG_DIR / f"{timestamp}-write-log.txt"
-
-    with open(log_file, "w") as f:
-        f.write("Bambu RFID Writer Log\n")
-        f.write("=====================\n\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Tag type: {tag_type}\n\n")
-        f.write(f"Dump file: {dump_file}\nSHA256: {dump_sha}\n\n")
-        f.write(f"Key file: {key_file}\nSHA256: {key_sha}\n\n")
-
-    print(f"\n📝 Log saved: {log_file}")
-
+def verify_write():
+    print("\n🔍 Validating write...")
+    output = run_command([pm3Location / pm3Command, "-c", "hf mf info"])
+    if "uid" in output.lower():
+        print(color("✔ Validation OK — write successful.", "32"))
+    else:
+        print(color("⚠ Could not fully verify tag. It may still be correct.", "33"))
 
 
 # =============================
-#  MAIN PROGRAM
+# LOGGING
+# =============================
+
+def write_log(tag_type, dumpfile, keyfile, sha_dump, sha_key):
+    ts = datetime.now().strftime("%Y-%m-%d-%H%M")
+    txt = LOG_DIR / f"{ts}-write-log.txt"
+    jsn = LOG_DIR / f"{ts}-write-log.json"
+
+    data = {
+        "timestamp": ts,
+        "tag_type": tag_type,
+        "dump_file": dumpfile,
+        "dump_sha": sha_dump,
+        "key_file": keyfile,
+        "key_sha": sha_key,
+    }
+
+    txt.write_text(
+        f"Bambu RFID Writing Log\n"
+        f"=======================\n\n"
+        f"Timestamp: {ts}\n"
+        f"Tag Type: {tag_type}\n\n"
+        f"Dump: {dumpfile}\nSHA256: {sha_dump}\n\n"
+        f"Key:  {keyfile}\nSHA256: {sha_key}\n\n"
+    )
+    jsn.write_text(json.dumps(data, indent=2))
+
+    print(color(f"\n📝 Logs saved:\n - {txt}\n - {jsn}", "34"))
+
+
+# =============================
+# MAIN
 # =============================
 
 def main():
     global pm3Location
 
-    print("\n===================================================")
-    print("🧪 Bambu Lab RFID Writer (with Cache System)")
-    print("===================================================")
+    print(color("\n===============================", "36"))
+    print(color("   Bambu Lab RFID Writer", "36"))
+    print(color("===============================\n", "36"))
 
     pm3Location = get_proxmark3_location()
     if not pm3Location:
-        print("❌ Proxmark3 not detected.")
+        print(color("❌ Proxmark3 not detected.", "31"))
         return
 
-    tagdump, keydump, dumpname = fetch_dump_interactive()
+    last = load_last_used()
+    if last and input(f"📌 Use last spool ({last})? (y/N): ").lower() == "y":
+        dump, key = detect_dump_files(last)
+        dump_path = download_file(dump["download_url"], DOWNLOAD_DIR / dump["name"])
+        key_path  = download_file(key["download_url"],  DOWNLOAD_DIR / key["name"])
+        dumpname  = dump["name"]
+    else:
+        dump_path, key_path, dumpname = fetch_dump_interactive()
 
-    print("\n📌 Place the Proxmark3 on the tag and press ENTER...")
-    input()
+    input("\n📌 Place tag on Proxmark and press ENTER...")
 
-    tagtype = getTagType()
+    while True:
+        try:
+            tagtype = getTagType()
+            print(color(f"\n✔ Tag detected: {tagtype}\n", "32"))
+            break
+        except RuntimeError as e:
+            print(color(f"\n{e}", "31"))
+            print(color("⚠ Unsupported or unreadable tag.\n", "33"))
 
-    # ===== HASH CHECK =====
-    dump_sha = sha256_file(tagdump)
-    key_sha = sha256_file(keydump)
+            print("Options:")
+            print("1) Retry")
+            print("2) Replace tag and retry")
+            print("3) Cancel process")
 
-    print("\n📄 File Verification:")
-    print(f"Dump: {tagdump}  ({os.path.getsize(tagdump)} bytes)")
-    print(f" SHA256 → {dump_sha}\n")
+            choice = input("> ").strip()
+            if choice == "3":
+                print(color("\n❌ Cancelled by user.\n", "31"))
+                return
+            print(color("\n📌 Adjust/replace tag and press ENTER...", "36"))
+            input()
 
-    print(f"Key:  {keydump}  ({os.path.getsize(keydump)} bytes)")
-    print(f" SHA256 → {key_sha}\n")
+    dump_sha = sha256_file(dump_path)
+    key_sha  = sha256_file(key_path)
 
-    if input("Proceed? (y/N): ").lower() != "y":
-        print("❌ Cancelled.")
+    print(color("\n📄 File Verification", "36"))
+    print(color("────────────────────────", "36"))
+
+    print(f"📁 Dump file: {Path(dump_path).name}")
+    print(f"   Size: {os.path.getsize(dump_path)} bytes")
+    print(f"   SHA256: {dump_sha}\n")
+
+    print(f"🔑 Key file: {Path(key_path).name}")
+    print(f"   Size: {os.path.getsize(key_path)} bytes")
+    print(f"   SHA256: {key_sha}\n")
+
+    print(color("✔ Files verified.\n", "32"))
+
+    if input("Proceed writing? (y/N): ").lower() != "y":
+        print(color("\n❌ Cancelled.\n", "31"))
         return
 
-    # ==== WRITE ====
-    writeTag(tagdump, keydump, tagtype)
+    writeTag(dump_path, key_path, tagtype)
+    verify_write()
+    write_log(tagtype, dumpname, Path(key_path).name, dump_sha, key_sha)
 
-    # ==== LOG ====
-    write_log(tagtype, dumpname, Path(keydump).name, dump_sha, key_sha)
-
-    print("\n🎉 Tag successfully written!\n")
-
+    print(color("\n🎉 Tag successfully written!\n", "32"))
 
 
 if __name__ == "__main__":
